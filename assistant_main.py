@@ -29,7 +29,14 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 # Browser-Use imports
 import asyncio
 from browser_use import Agent as BrowserAgent, Tools, ActionResult, BrowserSession
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI as _BaseChatOpenAI
+from pydantic import Field
+
+# browser-use v0.11 accesses llm.provider internally.
+# langchain_openai.ChatOpenAI doesn't have this attribute, so we add it.
+class ChatOpenAI(_BaseChatOpenAI):
+    """ChatOpenAI with the 'provider' field required by browser-use."""
+    provider: str = Field(default="openai")
 
 # Load environment variables
 load_dotenv()
