@@ -261,12 +261,37 @@ async def _run_browser_task(user_id: str, task_description: str):
     - Always starts from Google.
     - Pauses to ask the user via Telegram when personal data is needed.
     - Browser session stays alive between questions.
-    - Sends per-step progress updates to the user via Telegram.
+    - Sends per-step screenshots to Telegram.
     """
     logger.info(f"[BrowserUse][{user_id}] _run_browser_task started: {task_description[:80]}")
-    tools = Tools()
 
-    # We hold a mutable reference to the agent so the tool can pause/resume it.
+    loop = asyncio.get_event_loop()
+
+    # ----------------------------------------------------------------
+    # Non-blocking Telegram helpers
+    # bot.send_message/photo are SYNCHRONOUS (HTTP requests).
+    # Calling them directly inside a coroutine blocks the entire event
+    # loop, preventing Playwright from making progress.
+    # run_in_executor offloads the call to a thread pool.
+    # ----------------------------------------------------------------
+    async def _tg_msg(text: str, parse_mode: str = "Markdown"):
+        try:
+            await loop.run_in_executor(
+                None, lambda: bot.send_message(chat_id=user_id, text=text, parse_mode=parse_mode)
+            )
+        except Exception as e:
+            logger.warning(f"[BrowserUse] Telegram send_message failed: {e}")
+
+    async def _tg_photo(photo_bytes: bytes, caption: str = ""):
+        try:
+            buf = io.BytesIO(photo_bytes)
+            await loop.run_in_executor(
+                None, lambda: bot.send_photo(chat_id=user_id, photo=buf, caption=caption)
+            )
+        except Exception as e:
+            logger.warning(f"[BrowserUse] Telegram send_photo failed: {e}")
+
+    tools = Tools()
     agent_holder = [None]
 
     @tools.action(
@@ -278,23 +303,17 @@ async def _run_browser_task(user_id: str, task_description: str):
     async def ask_user_via_telegram(question: str) -> ActionResult:
         """Send a question to the user on Telegram, pause the browser, and resume with their answer."""
         logger.info(f"[BrowserUse][{user_id}] Asking user: {question}")
-        # Pause the browser agent — the Chromium window stays alive
         if agent_holder[0] is not None:
             agent_holder[0].pause()
 
-        # Notify user
-        bot.send_message(
-            chat_id=user_id,
-            text=f"🌐 *הדפדפן שואל:*\n{question}\n\n_(ענה כאן בטלגרם כדי שהדפדפן ימשיך)_",
-            parse_mode="Markdown"
+        await _tg_msg(
+            f"🌐 *הדפדפן שואל:*\n{question}\n\n_(ענה כאן בטלגרם כדי שהדפדפן ימשיך)_"
         )
 
-        # Create a Future on this loop and store it so handle_message can resolve it
         future = _browser_loop.create_future()
         _pending_browser_questions[user_id] = future
 
         try:
-            # Wait up to 5 minutes for the user's Telegram reply
             answer = await asyncio.wait_for(asyncio.shield(future), timeout=300)
             logger.info(f"[BrowserUse][{user_id}] Got user answer: {answer}")
         except asyncio.TimeoutError:
@@ -306,20 +325,16 @@ async def _run_browser_task(user_id: str, task_description: str):
         finally:
             _pending_browser_questions.pop(user_id, None)
 
-        # Resume the browser
         if agent_holder[0] is not None:
             agent_holder[0].resume()
-
         return ActionResult(extracted_content=f"User answered: {answer}")
 
-    # Build LLM using OpenRouter via OpenAI-compatible endpoint
     llm = ChatOpenAI(
         model="openai/gpt-4o-mini",
         api_key=OPENROUTER_API_KEY,
         base_url="https://openrouter.ai/api/v1",
     )
 
-    # Always start from Google, never fabricate user data
     full_task = (
         f"Start from google.com and continue from there. Do what you need to do: {task_description}\n\n"
         "CRITICAL RULES:\n"
@@ -330,106 +345,88 @@ async def _run_browser_task(user_id: str, task_description: str):
         "5. After getting an answer, continue the task from where you paused."
     )
 
-    # Headless Chromium — required for server/Railway deployment (no display)
-    browser_session = BrowserSession(headless=True)
-
-    agent = BrowserAgent(
-        task=full_task,
-        llm=llm,
-        tools=tools,
-        browser_session=browser_session,
-    )
-    agent_holder[0] = agent
-    logger.info(f"[BrowserUse][{user_id}] Agent and BrowserSession created.")
-
-    # --- Step hook: send URL + title to Telegram on every agent step ---
-    step_counter = [0]
-
-    async def _on_step_start(ag: BrowserAgent):
-        step_counter[0] += 1
-        step_num = step_counter[0]
-        try:
-            current_url = await ag.browser_session.get_current_page_url()
-            current_title = await ag.browser_session.get_current_page_title()
-        except Exception:
-            current_url = "N/A"
-            current_title = ""
-        logger.info(f"[BrowserUse][{user_id}] Step {step_num} | {current_url}")
-
-        # Try to send a screenshot; fall back to a text update
-        screenshot_sent = False
-        try:
-            if hasattr(ag.browser_session, 'context') and ag.browser_session.context:
-                pages = ag.browser_session.context.pages
-                if pages:
-                    screenshot_bytes = await pages[0].screenshot(full_page=False)
-                    caption = f"\U0001f504 שלב {step_num} | {current_title or current_url}"
-                    bot.send_photo(
-                        chat_id=user_id,
-                        photo=io.BytesIO(screenshot_bytes),
-                        caption=caption
-                    )
-                    screenshot_sent = True
-        except Exception as sc_err:
-            logger.warning(f"[BrowserUse] Screenshot failed at step {step_num}: {sc_err}")
-
-        if not screenshot_sent:
-            try:
-                bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"\U0001f504 *שלב {step_num}*\n"
-                        f"\U0001f4c4 {current_title or 'טוען...'}\n"
-                        f"\U0001f517 `{current_url}`"
-                    ),
-                    parse_mode="Markdown"
-                )
-            except Exception as send_err:
-                logger.warning(f"[BrowserUse] Step update failed: {send_err}")
-
+    browser_session = None
     try:
-        bot.send_message(
-            chat_id=user_id,
-            text=(
-                "\U0001f310 *הדפדפן הופעל!*\n"
-                "מתחיל מגוגל ועובד על המשימה שלך...\n"
-                "_אשלח לך צילום מסך בכל שלב._"
-            ),
-            parse_mode="Markdown"
+        # ----- Browser + Agent creation (inside try so errors are caught) -----
+        logger.info(f"[BrowserUse][{user_id}] Creating BrowserSession...")
+        browser_session = BrowserSession(headless=True)
+
+        logger.info(f"[BrowserUse][{user_id}] Creating BrowserAgent...")
+        agent = BrowserAgent(
+            task=full_task,
+            llm=llm,
+            tools=tools,
+            browser_session=browser_session,
         )
-        logger.info(f"[BrowserUse][{user_id}] Calling agent.run() now...")
+        agent_holder[0] = agent
+        logger.info(f"[BrowserUse][{user_id}] Agent ready.")
+
+        # ----- Step hook: screenshot per step, fallback to URL text -----
+        step_counter = [0]
+
+        async def _on_step_start(ag: BrowserAgent):
+            step_counter[0] += 1
+            step_num = step_counter[0]
+            try:
+                current_url   = await ag.browser_session.get_current_page_url()
+                current_title = await ag.browser_session.get_current_page_title()
+            except Exception:
+                current_url   = "N/A"
+                current_title = ""
+            logger.info(f"[BrowserUse][{user_id}] Step {step_num} | {current_url}")
+
+            # Try screenshot first
+            screenshot_sent = False
+            try:
+                if hasattr(ag.browser_session, "context") and ag.browser_session.context:
+                    pages = ag.browser_session.context.pages
+                    if pages:
+                        screenshot_bytes = await pages[0].screenshot(full_page=False)
+                        caption = f"🔄 שלב {step_num} | {current_title or current_url}"
+                        await _tg_photo(screenshot_bytes, caption=caption)
+                        screenshot_sent = True
+            except Exception as sc_err:
+                logger.warning(f"[BrowserUse] Screenshot failed at step {step_num}: {sc_err}")
+
+            if not screenshot_sent:
+                await _tg_msg(
+                    f"🔄 *שלב {step_num}*\n"
+                    f"📄 {current_title or 'טוען...'}\n"
+                    f"🔗 `{current_url}`"
+                )
+
+        # ----- Notify user and run -----
+        await _tg_msg(
+            "🌐 *הדפדפן הופעל!*\n"
+            "מתחיל מגוגל ועובד על המשימה שלך...\n"
+            "_אשלח לך צילום מסך בכל שלב._"
+        )
+
+        logger.info(f"[BrowserUse][{user_id}] Calling agent.run()...")
         history = await agent.run(on_step_start=_on_step_start, max_steps=50)
-        logger.info(f"[BrowserUse][{user_id}] agent.run() completed after {step_counter[0]} steps.")
+        logger.info(f"[BrowserUse][{user_id}] agent.run() done after {step_counter[0]} steps.")
 
-        # Extract the final result text
         extracted = history.extracted_content()
-        if extracted:
-            final_answer = extracted[-1]
-        else:
-            final_answer = "המשימה הושלמה. לא נמצא סיכום מפורש."
-
-        bot.send_message(
-            chat_id=user_id,
-            text=f"\u2705 *הדפדפן סיים ({step_counter[0]} שלבים):*\n{final_answer}",
-            parse_mode="Markdown"
-        )
+        final_answer = extracted[-1] if extracted else "המשימה הושלמה. לא נמצא סיכום מפורש."
+        await _tg_msg(f"✅ *הדפדפן סיים ({step_counter[0]} שלבים):*\n{final_answer}")
         return final_answer
 
-    except asyncio.TimeoutError:
-        logger.error(f"[BrowserUse][{user_id}] Timeout.")
-        bot.send_message(chat_id=user_id, text="\u23f1\ufe0f פג הזמן להמתנה. משימת הדפדפן בוטלה.")
     except Exception as e:
         logger.error(f"[BrowserUse][{user_id}] Task error: {e}", exc_info=True)
-        bot.send_message(chat_id=user_id, text=f"\u274c שגיאה בדפדפן:\n`{e}`", parse_mode="Markdown")
+        try:
+            await _tg_msg(f"❌ שגיאה בדפדפן:\n`{e}`")
+        except Exception:
+            pass
     finally:
         with _browser_user_lock:
             _browser_running_users.discard(user_id)
         _active_browser_tasks.pop(user_id, None)
         _pending_browser_questions.pop(user_id, None)
-        try:
-            await browser_session.close()
-        except Exception:
-            pass
+        if browser_session is not None:
+            try:
+                await browser_session.close()
+            except Exception:
+                pass
 
 
 def launch_browser_task(user_id: str, task_description: str) -> str:
