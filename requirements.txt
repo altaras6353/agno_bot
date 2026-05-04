@@ -14,3 +14,6 @@ soundfile
 SpeechRecognition
 pytz
 python-dateutil
+browser-use
+langchain-openai
+playwright

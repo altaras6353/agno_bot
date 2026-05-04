@@ -26,6 +26,11 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
+# Browser-Use imports
+import asyncio
+from browser_use import Agent as BrowserAgent, Tools, ActionResult, BrowserSession
+from langchain_openai import ChatOpenAI
+
 # Load environment variables
 load_dotenv()
 
@@ -224,8 +229,160 @@ def get_user_credentials(user_id: str):
     return None
 
 # ==========================================
-# Agent Setup
+# Browser-Use Engine
 # ==========================================
+
+# Dedicated asyncio event loop running in a background thread.
+# browser-use is fully async; telebot is sync — this bridges the gap.
+_browser_loop = asyncio.new_event_loop()
+
+def _start_browser_loop():
+    asyncio.set_event_loop(_browser_loop)
+    _browser_loop.run_forever()
+
+threading.Thread(target=_start_browser_loop, daemon=True, name="BrowserUseLoop").start()
+
+# Per-user pending question: { user_id -> asyncio.Future }
+# Set when the browser agent is waiting for a Telegram reply.
+_pending_browser_questions: dict = {}
+
+# Per-user active browser task (concurrent.futures.Future from run_coroutine_threadsafe)
+_active_browser_tasks: dict = {}
+
+
+async def _run_browser_task(user_id: str, task_description: str):
+    """
+    Runs a browser-use agent for a given user.
+    - Always starts from Google.
+    - Pauses to ask the user via Telegram when personal data is needed.
+    - Browser session stays alive between questions.
+    """
+    tools = Tools()
+
+    # We hold a mutable reference to the agent so the tool can pause/resume it.
+    agent_holder = [None]
+
+    @tools.action(
+        "Ask the user a question via Telegram and wait for their reply. "
+        "ALWAYS use this tool when you need any personal information from the user "
+        "(name, phone number, email, date of birth, preferences, etc.). "
+        "NEVER invent or guess user data — always ask."
+    )
+    async def ask_user_via_telegram(question: str) -> ActionResult:
+        """Send a question to the user on Telegram, pause the browser, and resume with their answer."""
+        # Pause the browser agent — the Chromium window stays alive
+        if agent_holder[0] is not None:
+            agent_holder[0].pause()
+
+        # Notify user
+        bot.send_message(
+            chat_id=user_id,
+            text=f"🌐 *הדפדפן שואל:*\n{question}\n\n_(ענה כאן בטלגרם כדי שהדפדפן ימשיך)_",
+            parse_mode="Markdown"
+        )
+
+        # Create a Future on this loop and store it so handle_message can resolve it
+        future = _browser_loop.create_future()
+        _pending_browser_questions[user_id] = future
+
+        try:
+            # Wait up to 5 minutes for the user's Telegram reply
+            answer = await asyncio.wait_for(asyncio.shield(future), timeout=300)
+        except asyncio.TimeoutError:
+            _pending_browser_questions.pop(user_id, None)
+            if agent_holder[0] is not None:
+                agent_holder[0].resume()
+            return ActionResult(extracted_content="User did not respond in time. Task cancelled.")
+        finally:
+            _pending_browser_questions.pop(user_id, None)
+
+        # Resume the browser
+        if agent_holder[0] is not None:
+            agent_holder[0].resume()
+
+        return ActionResult(extracted_content=f"User answered: {answer}")
+
+    # Build LLM using OpenRouter via OpenAI-compatible endpoint
+    llm = ChatOpenAI(
+        model="openai/gpt-4o-mini",
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    # Always start from Google, never fabricate user data
+    full_task = (
+        f"Start from google.com and continue from there. Do what you need to do: {task_description}\n\n"
+        "CRITICAL RULES:\n"
+        "1. Always start by navigating to google.com first.\n"
+        "2. NEVER invent or guess any personal user data (name, phone, email, address, etc.).\n"
+        "3. When you need any personal information to complete the task, ALWAYS call ask_user_via_telegram.\n"
+        "4. Do not proceed with a form if you are missing required information — ask first.\n"
+        "5. After getting an answer, continue the task from where you paused."
+    )
+
+    # Headless Chromium session
+    browser_session = BrowserSession(headless=True)
+
+    agent = BrowserAgent(
+        task=full_task,
+        llm=llm,
+        tools=tools,
+        browser_session=browser_session,
+    )
+    agent_holder[0] = agent
+
+    try:
+        bot.send_message(
+            chat_id=user_id,
+            text="🌐 *הדפדפן הופעל!*\nמתחיל מגוגל ועובד על המשימה שלך...\nאעדכן אותך בסיום, או אשאל אם נדרש מידע.",
+            parse_mode="Markdown"
+        )
+        history = await agent.run(max_steps=50)
+
+        # Extract the final result text
+        extracted = history.extracted_content()
+        if extracted:
+            final_answer = extracted[-1]
+        else:
+            final_answer = "המשימה הושלמה. לא נמצא סיכום מפורש."
+
+        bot.send_message(
+            chat_id=user_id,
+            text=f"✅ *הדפדפן סיים:*\n{final_answer}",
+            parse_mode="Markdown"
+        )
+        return final_answer
+
+    except asyncio.TimeoutError:
+        bot.send_message(chat_id=user_id, text="⏱️ פג הזמן להמתנה. משימת הדפדפן בוטלה.")
+    except Exception as e:
+        logger.error(f"Browser task error for user {user_id}: {e}", exc_info=True)
+        bot.send_message(chat_id=user_id, text=f"❌ שגיאה בדפדפן: {e}")
+    finally:
+        _active_browser_tasks.pop(user_id, None)
+        _pending_browser_questions.pop(user_id, None)
+        try:
+            await browser_session.close()
+        except Exception:
+            pass
+
+
+def launch_browser_task(user_id: str, task_description: str) -> str:
+    """
+    Submits a browser task to the dedicated asyncio loop.
+    Called synchronously by the Agno agent tool.
+    """
+    if user_id in _active_browser_tasks:
+        task = _active_browser_tasks[user_id]
+        if not task.done():
+            return "⚠️ כבר פועלת משימת דפדפן. המתן לסיומה לפני הרצת משימה חדשה."
+
+    coro = _run_browser_task(user_id, task_description)
+    future = asyncio.run_coroutine_threadsafe(coro, _browser_loop)
+    _active_browser_tasks[user_id] = future
+    return "🚀 משימת הדפדפן הושקה! הדפדפן מתחיל מגוגל ויעדכן אותך כשיסיים, או אם יצטרך מידע נוסף ממך."
+
+
 def create_agent(user_id: str) -> Agent:
     db = PostgresDb(db_url=DB_URL, session_table="agent_sessions")
     
@@ -311,6 +468,18 @@ def create_agent(user_id: str) -> Agent:
 
     tools = [add_user_fact, get_user_facts, schedule_user_reminder, get_user_reminders, update_user_reminder, cancel_user_reminder]
     
+    # Browser-use tool: lets the Agno agent delegate web tasks to the browser agent
+    def browse_web_for_user(task_description: str) -> str:
+        """Launch a real headless browser to perform a task on the internet on behalf of the user.
+        Use this when the user wants to: book a table, buy tickets, fill out a form, search for
+        availability, or do ANYTHING that requires navigating and interacting with a real website.
+        The browser always starts from Google and navigates from there.
+        It will automatically ask the user for any required personal information via Telegram.
+        Do NOT attempt to do web browsing yourself — always use this tool."""
+        return launch_browser_task(user_id, task_description)
+
+    tools.append(browse_web_for_user)
+
     # Check if user has authenticated with Google Calendar
     creds = get_user_credentials(user_id)
     if creds:
@@ -323,6 +492,7 @@ def create_agent(user_id: str) -> Agent:
             link = get_auth_url(user_id)
             return f"Tell the user they must authenticate first by clicking this link: {link}"
         tools.append(request_calendar_auth)
+
 
     local_tz = pytz.timezone("Asia/Jerusalem")
     now = datetime.now(local_tz)
@@ -580,6 +750,14 @@ def handle_message(message):
             user_text = "Here is a message."
 
         logger.info(f"Received message from {user_id}: {user_text}")
+
+        # Check if this message is a reply to a pending browser question
+        if user_id in _pending_browser_questions:
+            future = _pending_browser_questions[user_id]
+            if not future.done():
+                _browser_loop.call_soon_threadsafe(future.set_result, user_text)
+                bot.reply_to(message, "✅ קיבלתי! הדפדפן ממשיך במשימה...")
+                return  # Don't pass to Agno agent — this was for the browser
 
         agent = create_agent(user_id)
         if images:
