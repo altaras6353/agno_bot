@@ -1,0 +1,14 @@
+.env
+token.json
+credentials.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.ogg
+*.wav
+temp_voice_*
+temp_photo_*
+firebase-debug.log
+test.png
