@@ -1,4 +1,5 @@
 agno
+openai
 psycopg2-binary
 apscheduler
 requests
