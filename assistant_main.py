@@ -61,6 +61,9 @@ CLIENT_SECRETS_FILE = "credentials.json"
 _railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
 REDIRECT_URI = f"https://{_railway_domain}/oauth2callback" if _railway_domain else f"http://localhost:{PORT}/oauth2callback"
 
+# Store PKCE code verifiers keyed by user_id (state)
+_pending_code_verifiers = {}
+
 def get_auth_url(user_id: str) -> str:
     """Generates the Google OAuth authorization URL for a given user."""
     if not os.path.exists(CLIENT_SECRETS_FILE):
@@ -72,7 +75,9 @@ def get_auth_url(user_id: str) -> str:
         redirect_uri=REDIRECT_URI
     )
     # Use 'state' to pass the user_id through the OAuth flow
-    auth_url, _ = flow.authorization_url(prompt='consent', state=user_id)
+    auth_url, _ = flow.authorization_url(prompt='consent', state=user_id, access_type='offline')
+    # Store the PKCE code_verifier so it can be used in the callback
+    _pending_code_verifiers[user_id] = flow.code_verifier
     return auth_url
 
 # ==========================================
@@ -407,7 +412,9 @@ def oauth2callback():
             scopes=SCOPES,
             redirect_uri=REDIRECT_URI
         )
-        flow.fetch_token(code=code)
+        # Restore the PKCE code_verifier from the original auth request
+        code_verifier = _pending_code_verifiers.pop(state, None)
+        flow.fetch_token(code=code, code_verifier=code_verifier)
         creds = flow.credentials
         
         # Save credentials to the database
