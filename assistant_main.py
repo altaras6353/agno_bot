@@ -3,7 +3,9 @@ import time
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
+from dateutil import parser as dateutil_parser
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -161,17 +163,39 @@ def get_facts(user_id: str) -> str:
     finally:
         conn.close()
 
+def parse_iso_time(iso_str: str) -> datetime:
+    """Parse an ISO 8601 datetime string."""
+    try:
+        return dateutil_parser.isoparse(iso_str)
+    except Exception:
+        return None
+
 def schedule_reminder(user_id: str, message: str, remind_at_iso: str) -> str:
-    """Schedules a future reminder for the user (ISO 8601 format)."""
+    """Schedules a future reminder for the user (ISO 8601 format). Converts UTC times to local timezone."""
+    local_tz = pytz.timezone("Asia/Jerusalem")
+    
     conn = get_db_connection()
     try:
+        # Parse the ISO string and convert to local time
+        parsed_dt = parse_iso_time(remind_at_iso)
+        if parsed_dt is None:
+            return f"Error: Invalid datetime format: {remind_at_iso}"
+        
+        # Ensure the datetime is in local timezone
+        if parsed_dt.tzinfo is None:
+            # Naive datetime - assume it's local time
+            local_dt = local_tz.localize(parsed_dt)
+        else:
+            # Aware datetime - convert to local time
+            local_dt = parsed_dt.astimezone(local_tz)
+        
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO reminders (user_id, message, remind_at) VALUES (%s, %s, %s)",
-                (user_id, message, remind_at_iso)
+                (user_id, message, local_dt)
             )
         conn.commit()
-        return f"Reminder scheduled for {remind_at_iso}."
+        return f"Reminder scheduled for {local_dt.strftime('%d/%m/%Y %H:%M')}."
     except Exception as e:
         conn.rollback()
         return f"Error scheduling reminder: {e}"
@@ -231,20 +255,31 @@ def create_agent(user_id: str) -> Agent:
         """Updates an existing reminder. Find the ID using get_user_reminders first."""
         if not new_message and not new_remind_at_iso:
             return "You must provide either new_message or new_remind_at_iso to update."
-        
+
+        local_tz = pytz.timezone("Asia/Jerusalem")
         conn = get_db_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM reminders WHERE id = %s AND user_id = %s AND status = 'pending'", (reminder_id, user_id))
                 if not cur.fetchone():
                     return f"Reminder ID {reminder_id} not found or not pending."
-                
-                if new_message and new_remind_at_iso:
-                    cur.execute("UPDATE reminders SET message = %s, remind_at = %s WHERE id = %s", (new_message, new_remind_at_iso, reminder_id))
+
+                new_remind_at = None
+                if new_remind_at_iso:
+                    parsed_dt = parse_iso_time(new_remind_at_iso)
+                    if parsed_dt is None:
+                        return f"Error: Invalid datetime format: {new_remind_at_iso}"
+                    if parsed_dt.tzinfo is None:
+                        new_remind_at = local_tz.localize(parsed_dt)
+                    else:
+                        new_remind_at = parsed_dt.astimezone(local_tz)
+
+                if new_message and new_remind_at:
+                    cur.execute("UPDATE reminders SET message = %s, remind_at = %s WHERE id = %s", (new_message, new_remind_at, reminder_id))
                 elif new_message:
                     cur.execute("UPDATE reminders SET message = %s WHERE id = %s", (new_message, reminder_id))
-                elif new_remind_at_iso:
-                    cur.execute("UPDATE reminders SET remind_at = %s WHERE id = %s", (new_remind_at_iso, reminder_id))
+                elif new_remind_at:
+                    cur.execute("UPDATE reminders SET remind_at = %s WHERE id = %s", (new_remind_at, reminder_id))
             conn.commit()
             return f"Successfully updated reminder ID {reminder_id}."
         except Exception as e:

@@ -12,3 +12,5 @@ sqlalchemy
 flask
 soundfile
 SpeechRecognition
+pytz
+python-dateutil
