@@ -256,7 +256,9 @@ async def _run_browser_task(user_id: str, task_description: str):
     - Always starts from Google.
     - Pauses to ask the user via Telegram when personal data is needed.
     - Browser session stays alive between questions.
+    - Sends per-step progress updates to the user via Telegram.
     """
+    logger.info(f"[BrowserUse][{user_id}] _run_browser_task started: {task_description[:80]}")
     tools = Tools()
 
     # We hold a mutable reference to the agent so the tool can pause/resume it.
@@ -270,6 +272,7 @@ async def _run_browser_task(user_id: str, task_description: str):
     )
     async def ask_user_via_telegram(question: str) -> ActionResult:
         """Send a question to the user on Telegram, pause the browser, and resume with their answer."""
+        logger.info(f"[BrowserUse][{user_id}] Asking user: {question}")
         # Pause the browser agent — the Chromium window stays alive
         if agent_holder[0] is not None:
             agent_holder[0].pause()
@@ -288,7 +291,9 @@ async def _run_browser_task(user_id: str, task_description: str):
         try:
             # Wait up to 5 minutes for the user's Telegram reply
             answer = await asyncio.wait_for(asyncio.shield(future), timeout=300)
+            logger.info(f"[BrowserUse][{user_id}] Got user answer: {answer}")
         except asyncio.TimeoutError:
+            logger.warning(f"[BrowserUse][{user_id}] User did not reply in time.")
             _pending_browser_questions.pop(user_id, None)
             if agent_holder[0] is not None:
                 agent_holder[0].resume()
@@ -320,8 +325,12 @@ async def _run_browser_task(user_id: str, task_description: str):
         "5. After getting an answer, continue the task from where you paused."
     )
 
-    # Headless Chromium session
-    browser_session = BrowserSession(headless=True)
+    # Visible Chromium with Chrome DevTools remote debugging on port 9222
+    REMOTE_DEBUG_PORT = 9222
+    browser_session = BrowserSession(
+        headless=False,
+        args=[f"--remote-debugging-port={REMOTE_DEBUG_PORT}"],
+    )
 
     agent = BrowserAgent(
         task=full_task,
@@ -330,14 +339,49 @@ async def _run_browser_task(user_id: str, task_description: str):
         browser_session=browser_session,
     )
     agent_holder[0] = agent
+    logger.info(f"[BrowserUse][{user_id}] Agent and BrowserSession created.")
+
+    # --- Step hook: send URL + title to Telegram on every agent step ---
+    step_counter = [0]
+
+    async def _on_step_start(ag: BrowserAgent):
+        step_counter[0] += 1
+        step_num = step_counter[0]
+        try:
+            current_url = await ag.browser_session.get_current_page_url()
+            current_title = await ag.browser_session.get_current_page_title()
+        except Exception:
+            current_url = "N/A"
+            current_title = ""
+        logger.info(f"[BrowserUse][{user_id}] Step {step_num} | {current_url}")
+        try:
+            bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"\U0001f504 *שלב {step_num}*\n"
+                    f"\U0001f4c4 {current_title or 'טוען...'}\n"
+                    f"\U0001f517 `{current_url}`"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception as send_err:
+            logger.warning(f"[BrowserUse] Step update send failed: {send_err}")
 
     try:
+        devtools_link = f"http://localhost:{REMOTE_DEBUG_PORT}"
         bot.send_message(
             chat_id=user_id,
-            text="🌐 *הדפדפן הופעל!*\nמתחיל מגוגל ועובד על המשימה שלך...\nאעדכן אותך בסיום, או אשאל אם נדרש מידע.",
+            text=(
+                "\U0001f310 *הדפדפן הופעל!*\n"
+                "מתחיל מגוגל ועובד על המשימה שלך...\n\n"
+                f"\U0001f441 *לצפייה חיה — פתח בדפדפן:*\n{devtools_link}\n\n"
+                "_אעדכן אותך בכל שלב._"
+            ),
             parse_mode="Markdown"
         )
-        history = await agent.run(max_steps=50)
+        logger.info(f"[BrowserUse][{user_id}] Calling agent.run() now...")
+        history = await agent.run(on_step_start=_on_step_start, max_steps=50)
+        logger.info(f"[BrowserUse][{user_id}] agent.run() completed after {step_counter[0]} steps.")
 
         # Extract the final result text
         extracted = history.extracted_content()
@@ -348,16 +392,17 @@ async def _run_browser_task(user_id: str, task_description: str):
 
         bot.send_message(
             chat_id=user_id,
-            text=f"✅ *הדפדפן סיים:*\n{final_answer}",
+            text=f"\u2705 *הדפדפן סיים ({step_counter[0]} שלבים):*\n{final_answer}",
             parse_mode="Markdown"
         )
         return final_answer
 
     except asyncio.TimeoutError:
-        bot.send_message(chat_id=user_id, text="⏱️ פג הזמן להמתנה. משימת הדפדפן בוטלה.")
+        logger.error(f"[BrowserUse][{user_id}] Timeout.")
+        bot.send_message(chat_id=user_id, text="\u23f1\ufe0f פג הזמן להמתנה. משימת הדפדפן בוטלה.")
     except Exception as e:
-        logger.error(f"Browser task error for user {user_id}: {e}", exc_info=True)
-        bot.send_message(chat_id=user_id, text=f"❌ שגיאה בדפדפן: {e}")
+        logger.error(f"[BrowserUse][{user_id}] Task error: {e}", exc_info=True)
+        bot.send_message(chat_id=user_id, text=f"\u274c שגיאה בדפדפן:\n`{e}`", parse_mode="Markdown")
     finally:
         _active_browser_tasks.pop(user_id, None)
         _pending_browser_questions.pop(user_id, None)
@@ -372,15 +417,23 @@ def launch_browser_task(user_id: str, task_description: str) -> str:
     Submits a browser task to the dedicated asyncio loop.
     Called synchronously by the Agno agent tool.
     """
+    logger.info(f"[BrowserUse][{user_id}] launch_browser_task called: {task_description[:80]}")
+
     if user_id in _active_browser_tasks:
         task = _active_browser_tasks[user_id]
         if not task.done():
-            return "⚠️ כבר פועלת משימת דפדפן. המתן לסיומה לפני הרצת משימה חדשה."
+            logger.info(f"[BrowserUse][{user_id}] Task already running — rejecting.")
+            return "\u26a0\ufe0f כבר פועלת משימת דפדפן. המתן לסיומה לפני הרצת משימה חדשה."
 
-    coro = _run_browser_task(user_id, task_description)
-    future = asyncio.run_coroutine_threadsafe(coro, _browser_loop)
-    _active_browser_tasks[user_id] = future
-    return "🚀 משימת הדפדפן הושקה! הדפדפן מתחיל מגוגל ויעדכן אותך כשיסיים, או אם יצטרך מידע נוסף ממך."
+    try:
+        coro = _run_browser_task(user_id, task_description)
+        future = asyncio.run_coroutine_threadsafe(coro, _browser_loop)
+        _active_browser_tasks[user_id] = future
+        logger.info(f"[BrowserUse][{user_id}] Task successfully submitted to browser loop.")
+        return "\U0001f680 משימת הדפדפן הושקה! הדפדפן מתחיל מגוגל ויעדכן אותך בכל שלב."
+    except Exception as e:
+        logger.error(f"[BrowserUse][{user_id}] Failed to submit task: {e}", exc_info=True)
+        return f"\u274c שגיאה בהפעלת הדפדפן: {e}"
 
 
 def create_agent(user_id: str) -> Agent:
