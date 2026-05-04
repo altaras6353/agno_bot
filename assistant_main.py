@@ -324,7 +324,8 @@ def create_agent(user_id: str) -> Agent:
             return f"Tell the user they must authenticate first by clicking this link: {link}"
         tools.append(request_calendar_auth)
 
-    now = datetime.now().astimezone()
+    local_tz = pytz.timezone("Asia/Jerusalem")
+    now = datetime.now(local_tz)
     current_time_str = now.isoformat()
     current_weekday = now.strftime("%A")
     
