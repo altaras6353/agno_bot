@@ -249,6 +249,11 @@ _pending_browser_questions: dict = {}
 # Per-user active browser task (concurrent.futures.Future from run_coroutine_threadsafe)
 _active_browser_tasks: dict = {}
 
+# Thread-safe set of users with an actively running browser task.
+# Prevents the Agno agent from double-launching if the first task fails fast.
+_browser_running_users: set = set()
+_browser_user_lock = threading.Lock()
+
 
 async def _run_browser_task(user_id: str, task_description: str):
     """
@@ -325,12 +330,8 @@ async def _run_browser_task(user_id: str, task_description: str):
         "5. After getting an answer, continue the task from where you paused."
     )
 
-    # Visible Chromium with Chrome DevTools remote debugging on port 9222
-    REMOTE_DEBUG_PORT = 9222
-    browser_session = BrowserSession(
-        headless=False,
-        args=[f"--remote-debugging-port={REMOTE_DEBUG_PORT}"],
-    )
+    # Headless Chromium — required for server/Railway deployment (no display)
+    browser_session = BrowserSession(headless=True)
 
     agent = BrowserAgent(
         task=full_task,
@@ -354,28 +355,45 @@ async def _run_browser_task(user_id: str, task_description: str):
             current_url = "N/A"
             current_title = ""
         logger.info(f"[BrowserUse][{user_id}] Step {step_num} | {current_url}")
+
+        # Try to send a screenshot; fall back to a text update
+        screenshot_sent = False
         try:
-            bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"\U0001f504 *שלב {step_num}*\n"
-                    f"\U0001f4c4 {current_title or 'טוען...'}\n"
-                    f"\U0001f517 `{current_url}`"
-                ),
-                parse_mode="Markdown"
-            )
-        except Exception as send_err:
-            logger.warning(f"[BrowserUse] Step update send failed: {send_err}")
+            if hasattr(ag.browser_session, 'context') and ag.browser_session.context:
+                pages = ag.browser_session.context.pages
+                if pages:
+                    screenshot_bytes = await pages[0].screenshot(full_page=False)
+                    caption = f"\U0001f504 שלב {step_num} | {current_title or current_url}"
+                    bot.send_photo(
+                        chat_id=user_id,
+                        photo=io.BytesIO(screenshot_bytes),
+                        caption=caption
+                    )
+                    screenshot_sent = True
+        except Exception as sc_err:
+            logger.warning(f"[BrowserUse] Screenshot failed at step {step_num}: {sc_err}")
+
+        if not screenshot_sent:
+            try:
+                bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"\U0001f504 *שלב {step_num}*\n"
+                        f"\U0001f4c4 {current_title or 'טוען...'}\n"
+                        f"\U0001f517 `{current_url}`"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as send_err:
+                logger.warning(f"[BrowserUse] Step update failed: {send_err}")
 
     try:
-        devtools_link = f"http://localhost:{REMOTE_DEBUG_PORT}"
         bot.send_message(
             chat_id=user_id,
             text=(
                 "\U0001f310 *הדפדפן הופעל!*\n"
-                "מתחיל מגוגל ועובד על המשימה שלך...\n\n"
-                f"\U0001f441 *לצפייה חיה — פתח בדפדפן:*\n{devtools_link}\n\n"
-                "_אעדכן אותך בכל שלב._"
+                "מתחיל מגוגל ועובד על המשימה שלך...\n"
+                "_אשלח לך צילום מסך בכל שלב._"
             ),
             parse_mode="Markdown"
         )
@@ -404,6 +422,8 @@ async def _run_browser_task(user_id: str, task_description: str):
         logger.error(f"[BrowserUse][{user_id}] Task error: {e}", exc_info=True)
         bot.send_message(chat_id=user_id, text=f"\u274c שגיאה בדפדפן:\n`{e}`", parse_mode="Markdown")
     finally:
+        with _browser_user_lock:
+            _browser_running_users.discard(user_id)
         _active_browser_tasks.pop(user_id, None)
         _pending_browser_questions.pop(user_id, None)
         try:
@@ -415,23 +435,28 @@ async def _run_browser_task(user_id: str, task_description: str):
 def launch_browser_task(user_id: str, task_description: str) -> str:
     """
     Submits a browser task to the dedicated asyncio loop.
-    Called synchronously by the Agno agent tool.
+    Uses a threading.Lock to guarantee only one task per user at a time,
+    preventing race conditions where Agno calls the tool twice.
     """
     logger.info(f"[BrowserUse][{user_id}] launch_browser_task called: {task_description[:80]}")
 
-    if user_id in _active_browser_tasks:
-        task = _active_browser_tasks[user_id]
-        if not task.done():
-            logger.info(f"[BrowserUse][{user_id}] Task already running — rejecting.")
+    with _browser_user_lock:
+        if user_id in _browser_running_users:
+            logger.info(f"[BrowserUse][{user_id}] Already running — rejecting duplicate call.")
             return "\u26a0\ufe0f כבר פועלת משימת דפדפן. המתן לסיומה לפני הרצת משימה חדשה."
+        # Reserve the slot BEFORE submitting to the loop to prevent any race
+        _browser_running_users.add(user_id)
 
     try:
         coro = _run_browser_task(user_id, task_description)
         future = asyncio.run_coroutine_threadsafe(coro, _browser_loop)
         _active_browser_tasks[user_id] = future
-        logger.info(f"[BrowserUse][{user_id}] Task successfully submitted to browser loop.")
-        return "\U0001f680 משימת הדפדפן הושקה! הדפדפן מתחיל מגוגל ויעדכן אותך בכל שלב."
+        logger.info(f"[BrowserUse][{user_id}] Task submitted successfully.")
+        return "\U0001f680 משימת הדפדפן הושקה! הדפדפן מתחיל מגוגל ויעדכן אותך בכל שלב עם צילום מסך."
     except Exception as e:
+        # If submission fails, release the slot immediately
+        with _browser_user_lock:
+            _browser_running_users.discard(user_id)
         logger.error(f"[BrowserUse][{user_id}] Failed to submit task: {e}", exc_info=True)
         return f"\u274c שגיאה בהפעלת הדפדפן: {e}"
 
